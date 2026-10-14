@@ -294,6 +294,44 @@ stage_chart = (stage_bars + stage_labels).properties(height=230).configure_axis(
 st.subheader("Where does delivery time accumulate?")
 st.altair_chart(stage_chart, width="stretch")
 
+# Keep the record-level evidence available after the summary charts. This is
+# the selected historical purchase cohort, not a live fulfillment queue.
+order_details = selected_orders[selected_orders["promise_missed"]].copy()
+order_details["Outcome"] = order_details["no_delivery_record"].map(
+    {True: "No delivery recorded", False: "Delivered late"}
+)
+order_details["Days late"] = (
+    order_details["order_delivered_customer_date"].dt.normalize()
+    - order_details["order_estimated_delivery_date"].dt.normalize()
+).dt.days.astype("Int64")
+order_details = order_details.sort_values(
+    ["no_delivery_record", "Days late"], ascending=[False, False]
+)
+order_details = order_details[
+    [
+        "order_id",
+        "Outcome",
+        "order_status",
+        "order_purchase_timestamp",
+        "order_estimated_delivery_date",
+        "order_delivered_carrier_date",
+        "order_delivered_customer_date",
+        "Days late",
+    ]
+].rename(
+    columns={
+        "order_id": "Order ID",
+        "order_status": "Status",
+        "order_purchase_timestamp": "Purchased",
+        "order_estimated_delivery_date": "Promised",
+        "order_delivered_carrier_date": "Carrier handoff",
+        "order_delivered_customer_date": "Delivered",
+    }
+)
+
+st.subheader(f"Order details · {len(order_details):,} missed promises")
+st.dataframe(order_details, hide_index=True, width="stretch", height=360)
+
 st.caption(
     f"Data: purchases {purchase_start:%Y-%m-%d} to {purchase_end:%Y-%m-%d} "
     "(Kaggle snapshot). Production plan: refresh weekly; review monthly."
