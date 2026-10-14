@@ -3,27 +3,24 @@ import pandas as pd
 import streamlit as st
 
 
-TEAM_NAME = "Team 10"  # Replace this with your actual team name.
+TEAM_NAME = "Team 10"  # Replace with your team name.
 
 st.set_page_config(page_title="Delivery Promise Review", layout="wide")
 
-# One row is one Olist order. The CSV sits in the app's working directory.
 df = pd.read_csv("olist_orders_dataset.csv")
-
-date_columns = [
+for column in [
     "order_purchase_timestamp",
     "order_delivered_carrier_date",
     "order_delivered_customer_date",
     "order_estimated_delivery_date",
-]
-for column in date_columns:
+]:
     df[column] = pd.to_datetime(df[column], errors="coerce")
 
 purchase_start = df["order_purchase_timestamp"].min()
 purchase_end = df["order_purchase_timestamp"].max()
 
-# The CSV has no extraction timestamp. This is only a proxy for the last
-# observable day; it is not a claim that the data was complete on that day.
+# The historical CSV has no extraction timestamp. The latest event provides
+# a proxy cutoff for which promised dates could have been observed.
 last_observed_event = max(
     df["order_purchase_timestamp"].max(),
     df["order_delivered_carrier_date"].max(),
@@ -31,14 +28,11 @@ last_observed_event = max(
 )
 observation_cutoff = last_observed_event.normalize() + pd.Timedelta(days=1)
 
-# Canceled/unavailable orders have no event date for that outcome. Exclude them
-# from the delivery-promise denominator rather than label them as late.
 excluded_status = df["order_status"].isin(["canceled", "unavailable"])
 missing_delivered_date = (
     (df["order_status"] == "delivered")
     & df["order_delivered_customer_date"].isna()
 )
-
 orders = df[
     df["order_purchase_timestamp"].notna()
     & df["order_estimated_delivery_date"].notna()
@@ -47,185 +41,222 @@ orders = df[
     & ~missing_delivered_date
 ].copy()
 
-# Compare calendar dates because the promised delivery field has date-level
-# meaning (00:00:00), while actual delivery includes time of day.
+# The promise is a calendar date, so delivery later that same day is on time.
+orders["due_date"] = orders["order_estimated_delivery_date"].dt.normalize()
 orders["delivered_late"] = (
     orders["order_delivered_customer_date"].notna()
     & (
         orders["order_delivered_customer_date"].dt.normalize()
-        > orders["order_estimated_delivery_date"].dt.normalize()
+        > orders["due_date"]
     )
 )
 orders["no_delivery_record"] = orders["order_delivered_customer_date"].isna()
 orders["promise_missed"] = (
     orders["delivered_late"] | orders["no_delivery_record"]
 )
-orders["purchase_month"] = orders["order_purchase_timestamp"].dt.to_period("M").astype(str)
 
-monthly = orders.groupby("purchase_month", sort=True).agg(
+# Daily due-date cohorts support a daily review. Include days without orders
+# when computing calendar-day rolling windows.
+daily = orders.groupby("due_date", sort=True).agg(
     order_count=("order_id", "size"),
     missed=("promise_missed", "sum"),
     delivered_late=("delivered_late", "sum"),
     no_delivery_record=("no_delivery_record", "sum"),
 )
-monthly["miss_rate_pct"] = 100 * monthly["missed"] / monthly["order_count"]
-monthly["late_rate_pct"] = 100 * monthly["delivered_late"] / monthly["order_count"]
-monthly["no_record_rate_pct"] = (
-    100 * monthly["no_delivery_record"] / monthly["order_count"]
+daily = daily.reindex(
+    pd.date_range(daily.index.min(), daily.index.max(), freq="D"),
+    fill_value=0,
 )
+daily.index.name = "due_date"
+daily["orders_7d"] = daily["order_count"].rolling(7, min_periods=1).sum()
+for name in ["missed", "delivered_late", "no_delivery_record"]:
+    daily[f"{name}_7d"] = daily[name].rolling(7, min_periods=1).sum()
+    daily[f"{name}_rate_pct"] = (
+        100 * daily[name] / daily["order_count"].where(daily["order_count"] > 0)
+    )
+    daily[f"{name}_7d_pct"] = (
+        100 * daily[f"{name}_7d"] / daily["orders_7d"].where(daily["orders_7d"] > 0)
+    )
 
-# Sparse opening and closing months would make a monthly comparison misleading.
-month_options = monthly.index[monthly["order_count"] >= 500].tolist()
-if not month_options:
-    st.error("No purchase month has enough due orders for this review.")
+# Omit single-order days from the selector. Open on the last substantial
+# historical month so the sparse tail of the snapshot is not the first view.
+date_options = daily.index[
+    (daily["order_count"] >= 50) & (daily["orders_7d"] >= 500)
+].tolist()
+if not date_options:
+    st.error("No date has enough due orders for this review.")
     st.stop()
+
+month_counts = orders.groupby(orders["due_date"].dt.to_period("M")).size()
+substantial_months = month_counts[month_counts >= 5000]
+default_month = (
+    substantial_months.index[-1]
+    if not substantial_months.empty
+    else date_options[-1].to_period("M")
+)
+default_dates = [day for day in date_options if day.to_period("M") == default_month]
+default_date = default_dates[-1] if default_dates else date_options[-1]
 
 st.title(f"{TEAM_NAME} | Delivery Promise Review")
 st.caption(
-    "For the fulfillment manager: identify a rise in missed delivery promises "
-    "and decide whether to investigate handoff or delivery time."
+    "For the fulfillment manager: check delivery promises due recently "
+    "and decide whether to investigate handoff or transit time."
 )
 
-selected_month = st.selectbox(
-    "Purchase month to review",
-    month_options,
-    index=len(month_options) - 1,
+selected_date = st.selectbox(
+    "Promised delivery date",
+    date_options,
+    index=date_options.index(default_date),
+    format_func=lambda day: day.strftime("%Y-%m-%d"),
 )
-selected_index = month_options.index(selected_month)
-selected_orders = orders[orders["purchase_month"] == selected_month]
-current = monthly.loc[selected_month]
-current_rate = float(current["miss_rate_pct"])
-recent_months = month_options[max(0, selected_index - 5) : selected_index + 1]
-recent_history = monthly.loc[recent_months]
+window_start = selected_date - pd.Timedelta(days=6)
+previous_start = selected_date - pd.Timedelta(days=13)
+previous_end = selected_date - pd.Timedelta(days=7)
+selected_window = orders[orders["due_date"].between(window_start, selected_date)]
+previous_window = orders[orders["due_date"].between(previous_start, previous_end)]
+
+current = daily.loc[selected_date]
+current_rate = float(current["missed_7d_pct"])
+previous_rate = (
+    100 * previous_window["promise_missed"].mean()
+    if len(previous_window) >= 500
+    else None
+)
+delta = (
+    f"{current_rate - previous_rate:+.1f} pp vs prior 7 days"
+    if previous_rate is not None
+    else None
+)
+mini_history = daily.loc[window_start:selected_date]
 
 
 def mini_trend(column):
-    """Monthly history for a small chart inside a headline metric."""
-    if len(recent_history) < 2:
-        return None
-    return recent_history[column].tolist()
+    return mini_history[column].tolist()
 
-previous_rate = None
-if selected_index > 0:
-    previous_month = month_options[selected_index - 1]
-    previous_rate = float(monthly.loc[previous_month, "miss_rate_pct"])
-
-delta = None
-if previous_rate is not None:
-    delta = f"{current_rate - previous_rate:+.1f} pp vs {previous_month}"
 
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric(
-        "Missed promise rate",
+        "Missed promises · 7 days",
         f"{current_rate:.1f}%",
         delta=delta,
         delta_color="inverse",
-        chart_data=mini_trend("miss_rate_pct"),
+        chart_data=mini_trend("missed_7d_pct"),
         chart_type="line",
         border=True,
         height=220,
     )
 with col2:
     st.metric(
-        "Delivered late",
-        f"{current['late_rate_pct']:.1f}%",
-        chart_data=mini_trend("late_rate_pct"),
+        "Delivered late · 7 days",
+        f"{int(current['delivered_late_7d']):,}",
+        chart_data=mini_trend("delivered_late_7d"),
         chart_type="line",
         border=True,
         height=220,
     )
 with col3:
     st.metric(
-        "No delivery recorded",
-        f"{current['no_record_rate_pct']:.1f}%",
-        chart_data=mini_trend("no_record_rate_pct"),
+        "No delivery recorded · 7 days",
+        f"{int(current['no_delivery_record_7d']):,}",
+        chart_data=mini_trend("no_delivery_record_7d"),
         chart_type="line",
         border=True,
         height=220,
     )
 
 st.caption(
-    f"{int(current['order_count']):,} due orders in {selected_month}: "
-    f"{int(current['delivered_late']):,} delivered late and "
-    f"{int(current['no_delivery_record']):,} without a delivery record. "
-    f"Small trends show {recent_months[0]}–{selected_month}."
+    f"{int(current['orders_7d']):,} orders promised {window_start:%b %d}–"
+    f"{selected_date:%b %d, %Y}."
 )
 
 if previous_rate is not None and current_rate - previous_rate >= 2:
     st.warning(
-        f"Missed promises rose {current_rate - previous_rate:.1f} percentage "
-        f"points vs {previous_month}. Review the delivery stages below."
+        f"The 7-day missed-promise rate rose "
+        f"{current_rate - previous_rate:.1f} percentage points. "
+        "Review the delivery stages below."
     )
 
-# Chart 1: zoom in on the last four months to show the recent change.
-chart_months = recent_months[-4:]
-trend = monthly.loc[chart_months].reset_index()
-trend_parts = trend.melt(
-    id_vars="purchase_month",
-    value_vars=["late_rate_pct", "no_record_rate_pct"],
+# Daily bars show which outcome drives misses; the line separates a sustained
+# 7-day change from one noisy due date.
+chart_start = selected_date - pd.Timedelta(days=20)
+chart_days = daily.loc[chart_start:selected_date].reset_index()
+chart_days = chart_days[chart_days["order_count"] > 0]
+chart_days["series"] = "7-day miss rate"
+trend_parts = chart_days.melt(
+    id_vars=["due_date", "order_count"],
+    value_vars=["delivered_late_rate_pct", "no_delivery_record_rate_pct"],
     var_name="outcome",
     value_name="rate_pct",
 )
 trend_parts["outcome"] = trend_parts["outcome"].map(
     {
-        "late_rate_pct": "Delivered late",
-        "no_record_rate_pct": "No delivery record",
+        "delivered_late_rate_pct": "Delivered late",
+        "no_delivery_record_rate_pct": "No delivery record",
     }
 )
-
-month_axis = alt.X(
-    "purchase_month:O",
-    title=None,
-    sort=chart_months,
-    axis=alt.Axis(labelAngle=0),
+chart_max = max(
+    float(chart_days["missed_rate_pct"].max()),
+    float(chart_days["missed_7d_pct"].max()),
+    1.0,
 )
-trend_bars = alt.Chart(trend_parts).mark_bar(size=48).encode(
-    x=month_axis,
-    y=alt.Y(
-        "rate_pct:Q",
-        stack="zero",
-        title="Share of due orders (%)",
-        scale=alt.Scale(domain=[0, float(trend["miss_rate_pct"].max()) * 1.2]),
-    ),
+date_axis = alt.X(
+    "due_date:T",
+    title="Promised delivery date",
+    axis=alt.Axis(format="%b %d", tickCount=7, labelAngle=0),
+)
+chart_color = alt.Scale(
+    domain=["Delivered late", "No delivery record", "7-day miss rate"],
+    range=["#E9A24B", "#8292A4", "#245C8E"],
+)
+rate_axis = alt.Y(
+    "rate_pct:Q",
+    title="Share of due orders (%)",
+    scale=alt.Scale(domain=[0, chart_max * 1.15]),
+)
+bars = alt.Chart(trend_parts).mark_bar(size=17).encode(
+    x=date_axis,
+    y=rate_axis,
     color=alt.Color(
         "outcome:N",
-        scale=alt.Scale(
-            domain=["Delivered late", "No delivery record"],
-            range=["#E9A24B", "#8292A4"],
-        ),
+        scale=chart_color,
         legend=alt.Legend(title=None, orient="top"),
     ),
-    opacity=alt.condition(
-        alt.datum.purchase_month == selected_month,
-        alt.value(1),
-        alt.value(0.72),
-    ),
     tooltip=[
-        alt.Tooltip("purchase_month:O", title="Purchase month"),
+        alt.Tooltip("due_date:T", title="Promised date", format="%Y-%m-%d"),
         alt.Tooltip("outcome:N", title="Outcome"),
-        alt.Tooltip("rate_pct:Q", title="Share (%)", format=".1f"),
+        alt.Tooltip("rate_pct:Q", title="Daily share (%)", format=".1f"),
+        alt.Tooltip("order_count:Q", title="Due orders", format=","),
     ],
 )
-trend_labels = alt.Chart(trend).mark_text(
-    dy=-8, color="#243447", fontSize=12, fontWeight="bold"
-).encode(
-    x=month_axis,
-    y=alt.Y("miss_rate_pct:Q"),
-    text=alt.Text("miss_rate_pct:Q", format=".1f"),
+rolling_line = alt.Chart(chart_days).mark_line(strokeWidth=3).encode(
+    x=date_axis,
+    y=alt.Y(
+        "missed_7d_pct:Q",
+        title="Share of due orders (%)",
+        scale=alt.Scale(domain=[0, chart_max * 1.15]),
+    ),
+    color=alt.Color(
+        "series:N",
+        scale=chart_color,
+        legend=alt.Legend(title=None, orient="top"),
+    ),
+    tooltip=[
+        alt.Tooltip("due_date:T", title="Promised date", format="%Y-%m-%d"),
+        alt.Tooltip("missed_7d_pct:Q", title="7-day miss rate (%)", format=".1f"),
+    ],
 )
-trend_chart = (trend_bars + trend_labels).properties(height=290).configure_axis(
+daily_chart = (bars + rolling_line).properties(height=300).configure_axis(
     gridColor="#E8EDF3", labelColor="#516071", titleColor="#516071"
 ).configure_view(stroke=None)
 
-st.subheader("What drives missed promises?")
-st.altair_chart(trend_chart, width="stretch")
+st.subheader("Which due dates drove missed promises?")
+st.altair_chart(daily_chart, width="stretch")
 
-# Chart 2: compare elapsed stages within the selected month. These durations
-# can suggest where to investigate, but do not establish the cause of lateness.
-completed = selected_orders[
-    selected_orders["order_delivered_customer_date"].notna()
-    & selected_orders["order_delivered_carrier_date"].notna()
+# Compare elapsed stages over the same seven-day cohort as the KPI cards.
+completed = selected_window[
+    selected_window["order_delivered_customer_date"].notna()
+    & selected_window["order_delivered_carrier_date"].notna()
 ].copy()
 completed["handoff_days"] = (
     completed["order_delivered_carrier_date"]
@@ -238,65 +269,58 @@ completed["transit_days"] = (
 completed = completed[
     (completed["handoff_days"] >= 0) & (completed["transit_days"] >= 0)
 ]
-
 stage_medians = completed.groupby("delivered_late")[[
     "handoff_days", "transit_days"
 ]].median()
 stage_medians = stage_medians.reindex([False, True]).rename(
     index={False: "On time", True: "Late"},
-    columns={
-        "handoff_days": "Pre-handoff",
-        "transit_days": "Transit",
-    },
+    columns={"handoff_days": "Pre-handoff", "transit_days": "Transit"},
 )
-
 stage_plot = stage_medians.reset_index(names="Outcome").melt(
     id_vars="Outcome", var_name="Stage", value_name="Median days"
-)
-stage_plot = stage_plot.dropna(subset=["Median days"])
-stage_order = ["Pre-handoff", "Transit"]
-outcome_order = ["On time", "Late"]
-stage_axis = alt.Y("Stage:N", sort=stage_order, title=None)
-stage_offset = alt.YOffset("Outcome:N", sort=outcome_order)
-stage_color = alt.Color(
-    "Outcome:N",
-    scale=alt.Scale(domain=outcome_order, range=["#316DA8", "#E9A24B"]),
-    legend=alt.Legend(title=None, orient="top"),
-)
-stage_bars = alt.Chart(stage_plot).mark_bar(size=24).encode(
-    y=stage_axis,
-    yOffset=stage_offset,
-    x=alt.X(
-        "Median days:Q",
-        title="Median days",
-        scale=alt.Scale(domain=[0, float(stage_plot["Median days"].max()) * 1.25]),
-        axis=alt.Axis(tickCount=8, format=".0f"),
-    ),
-    color=stage_color,
-    tooltip=[
-        alt.Tooltip("Stage:N"),
-        alt.Tooltip("Outcome:N"),
-        alt.Tooltip("Median days:Q", format=".1f"),
-    ],
-)
-stage_labels = alt.Chart(stage_plot).mark_text(
-    align="left", dx=5, color="#243447", fontSize=12
-).encode(
-    y=stage_axis,
-    yOffset=stage_offset,
-    x=alt.X("Median days:Q"),
-    text=alt.Text("Median days:Q", format=".1f"),
-)
-stage_chart = (stage_bars + stage_labels).properties(height=230).configure_axis(
-    gridColor="#E8EDF3", labelColor="#516071", titleColor="#516071"
-).configure_view(stroke=None)
+).dropna(subset=["Median days"])
 
-st.subheader("Where does delivery time accumulate?")
-st.altair_chart(stage_chart, width="stretch")
+if not stage_plot.empty:
+    stage_order = ["Pre-handoff", "Transit"]
+    outcome_order = ["On time", "Late"]
+    stage_axis = alt.Y("Stage:N", sort=stage_order, title=None)
+    stage_offset = alt.YOffset("Outcome:N", sort=outcome_order)
+    stage_color = alt.Color(
+        "Outcome:N",
+        scale=alt.Scale(domain=outcome_order, range=["#316DA8", "#E9A24B"]),
+        legend=alt.Legend(title=None, orient="top"),
+    )
+    stage_bars = alt.Chart(stage_plot).mark_bar(size=24).encode(
+        y=stage_axis,
+        yOffset=stage_offset,
+        x=alt.X(
+            "Median days:Q",
+            title="Median days",
+            scale=alt.Scale(domain=[0, float(stage_plot["Median days"].max()) * 1.25]),
+            axis=alt.Axis(tickCount=8, format=".0f"),
+        ),
+        color=stage_color,
+        tooltip=[
+            alt.Tooltip("Stage:N"),
+            alt.Tooltip("Outcome:N"),
+            alt.Tooltip("Median days:Q", format=".1f"),
+        ],
+    )
+    stage_labels = alt.Chart(stage_plot).mark_text(
+        align="left", dx=5, color="#243447", fontSize=12
+    ).encode(
+        y=stage_axis,
+        yOffset=stage_offset,
+        x=alt.X("Median days:Q"),
+        text=alt.Text("Median days:Q", format=".1f"),
+    )
+    stage_chart = (stage_bars + stage_labels).properties(height=230).configure_axis(
+        gridColor="#E8EDF3", labelColor="#516071", titleColor="#516071"
+    ).configure_view(stroke=None)
+    st.subheader("Where does delivery time accumulate?")
+    st.altair_chart(stage_chart, width="stretch")
 
-# Keep the record-level evidence available after the summary charts. This is
-# the selected historical purchase cohort, not a live fulfillment queue.
-order_details = selected_orders[selected_orders["promise_missed"]].copy()
+order_details = selected_window[selected_window["promise_missed"]].copy()
 order_details["Outcome"] = order_details["no_delivery_record"].map(
     {True: "No delivery recorded", False: "Delivered late"}
 )
@@ -305,7 +329,8 @@ order_details["Days late"] = (
     - order_details["order_estimated_delivery_date"].dt.normalize()
 ).dt.days.astype("Int64")
 order_details = order_details.sort_values(
-    ["no_delivery_record", "Days late"], ascending=[False, False]
+    ["no_delivery_record", "due_date", "Days late"],
+    ascending=[False, False, False],
 )
 order_details = order_details[
     [
@@ -328,11 +353,10 @@ order_details = order_details[
         "order_delivered_customer_date": "Delivered",
     }
 )
-
 st.subheader(f"Order details · {len(order_details):,} missed promises")
 st.dataframe(order_details, hide_index=True, width="stretch", height=360)
 
 st.caption(
     f"Data: purchases {purchase_start:%Y-%m-%d} to {purchase_end:%Y-%m-%d} "
-    "(Kaggle snapshot). Production plan: refresh weekly; review monthly."
+    "(Kaggle snapshot). Production plan: refresh daily; review daily."
 )
