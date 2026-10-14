@@ -1,3 +1,4 @@
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -68,6 +69,10 @@ monthly = orders.groupby("purchase_month", sort=True).agg(
     no_delivery_record=("no_delivery_record", "sum"),
 )
 monthly["miss_rate_pct"] = 100 * monthly["missed"] / monthly["order_count"]
+monthly["late_rate_pct"] = 100 * monthly["delivered_late"] / monthly["order_count"]
+monthly["no_record_rate_pct"] = (
+    100 * monthly["no_delivery_record"] / monthly["order_count"]
+)
 
 # Sparse opening and closing months would make a monthly comparison misleading.
 month_options = monthly.index[monthly["order_count"] >= 500].tolist()
@@ -90,6 +95,15 @@ selected_index = month_options.index(selected_month)
 selected_orders = orders[orders["purchase_month"] == selected_month]
 current = monthly.loc[selected_month]
 current_rate = float(current["miss_rate_pct"])
+recent_months = month_options[max(0, selected_index - 5) : selected_index + 1]
+recent_history = monthly.loc[recent_months]
+
+
+def mini_trend(column):
+    """Monthly history for a small chart inside a headline metric."""
+    if len(recent_history) < 2:
+        return None
+    return recent_history[column].tolist()
 
 previous_rate = None
 if selected_index > 0:
@@ -107,32 +121,105 @@ with col1:
         f"{current_rate:.1f}%",
         delta=delta,
         delta_color="inverse",
+        chart_data=mini_trend("miss_rate_pct"),
+        chart_type="line",
+        border=True,
+        height=220,
     )
 with col2:
-    st.metric("Delivered late", f"{int(current['delivered_late']):,}")
+    st.metric(
+        "Delivered late",
+        f"{current['late_rate_pct']:.1f}%",
+        chart_data=mini_trend("late_rate_pct"),
+        chart_type="line",
+        border=True,
+        height=220,
+    )
 with col3:
-    st.metric("No delivery recorded", f"{int(current['no_delivery_record']):,}")
+    st.metric(
+        "No delivery recorded",
+        f"{current['no_record_rate_pct']:.1f}%",
+        chart_data=mini_trend("no_record_rate_pct"),
+        chart_type="line",
+        border=True,
+        height=220,
+    )
 
 st.caption(
-    f"Among {int(current['order_count']):,} selected orders whose promised date "
-    "had passed by the last observed day: a miss is a late recorded delivery "
-    "or no delivery record. Canceled and unavailable orders are excluded."
+    f"{int(current['order_count']):,} due orders in {selected_month}: "
+    f"{int(current['delivered_late']):,} delivered late and "
+    f"{int(current['no_delivery_record']):,} without a delivery record. "
+    f"Small trends show {recent_months[0]}–{selected_month}."
 )
 
 if previous_rate is not None and current_rate - previous_rate >= 2:
     st.warning(
-        "Proposed review trigger: the miss rate rose at least 2 percentage "
-        "points from the previous month. Check the stage comparison below "
-        "before assigning follow-up."
+        f"Missed promises rose {current_rate - previous_rate:.1f} percentage "
+        f"points vs {previous_month}. Review the delivery stages below."
     )
 
-# Chart 1: repeated monthly review of the same decision metric.
-recent_months = month_options[max(0, selected_index - 5) : selected_index + 1]
-trend = monthly.loc[recent_months, ["miss_rate_pct"]].rename(
-    columns={"miss_rate_pct": "Miss rate (%)"}
+# Chart 1: zoom in on the last four months to show the recent change.
+chart_months = recent_months[-4:]
+trend = monthly.loc[chart_months].reset_index()
+trend_parts = trend.melt(
+    id_vars="purchase_month",
+    value_vars=["late_rate_pct", "no_record_rate_pct"],
+    var_name="outcome",
+    value_name="rate_pct",
 )
-st.subheader("Missed promise rate across recent purchase months")
-st.line_chart(trend, y_label="Percent of due orders")
+trend_parts["outcome"] = trend_parts["outcome"].map(
+    {
+        "late_rate_pct": "Delivered late",
+        "no_record_rate_pct": "No delivery record",
+    }
+)
+
+month_axis = alt.X(
+    "purchase_month:O",
+    title=None,
+    sort=chart_months,
+    axis=alt.Axis(labelAngle=0),
+)
+trend_bars = alt.Chart(trend_parts).mark_bar(size=48).encode(
+    x=month_axis,
+    y=alt.Y(
+        "rate_pct:Q",
+        stack="zero",
+        title="Share of due orders (%)",
+        scale=alt.Scale(domain=[0, float(trend["miss_rate_pct"].max()) * 1.2]),
+    ),
+    color=alt.Color(
+        "outcome:N",
+        scale=alt.Scale(
+            domain=["Delivered late", "No delivery record"],
+            range=["#E9A24B", "#8292A4"],
+        ),
+        legend=alt.Legend(title=None, orient="top"),
+    ),
+    opacity=alt.condition(
+        alt.datum.purchase_month == selected_month,
+        alt.value(1),
+        alt.value(0.72),
+    ),
+    tooltip=[
+        alt.Tooltip("purchase_month:O", title="Purchase month"),
+        alt.Tooltip("outcome:N", title="Outcome"),
+        alt.Tooltip("rate_pct:Q", title="Share (%)", format=".1f"),
+    ],
+)
+trend_labels = alt.Chart(trend).mark_text(
+    dy=-8, color="#243447", fontSize=12, fontWeight="bold"
+).encode(
+    x=month_axis,
+    y=alt.Y("miss_rate_pct:Q"),
+    text=alt.Text("miss_rate_pct:Q", format=".1f"),
+)
+trend_chart = (trend_bars + trend_labels).properties(height=290).configure_axis(
+    gridColor="#E8EDF3", labelColor="#516071", titleColor="#516071"
+).configure_view(stroke=None)
+
+st.subheader("What drives missed promises?")
+st.altair_chart(trend_chart, width="stretch")
 
 # Chart 2: compare elapsed stages within the selected month. These durations
 # can suggest where to investigate, but do not establish the cause of lateness.
@@ -158,26 +245,56 @@ stage_medians = completed.groupby("delivered_late")[[
 stage_medians = stage_medians.reindex([False, True]).rename(
     index={False: "On time", True: "Late"},
     columns={
-        "handoff_days": "Purchase to carrier handoff",
-        "transit_days": "Carrier to customer",
+        "handoff_days": "Pre-handoff",
+        "transit_days": "Transit",
     },
 )
 
-st.subheader("Median days by delivery stage")
-st.bar_chart(stage_medians, y_label="Days", stack=False)
-st.caption(
-    "Stage comparison uses delivered orders with valid carrier dates. "
-    "Different durations are clues for investigation, not proof of cause."
+stage_plot = stage_medians.reset_index(names="Outcome").melt(
+    id_vars="Outcome", var_name="Stage", value_name="Median days"
 )
+stage_plot = stage_plot.dropna(subset=["Median days"])
+stage_order = ["Pre-handoff", "Transit"]
+outcome_order = ["On time", "Late"]
+stage_axis = alt.Y("Stage:N", sort=stage_order, title=None)
+stage_offset = alt.YOffset("Outcome:N", sort=outcome_order)
+stage_color = alt.Color(
+    "Outcome:N",
+    scale=alt.Scale(domain=outcome_order, range=["#316DA8", "#E9A24B"]),
+    legend=alt.Legend(title=None, orient="top"),
+)
+stage_bars = alt.Chart(stage_plot).mark_bar(size=24).encode(
+    y=stage_axis,
+    yOffset=stage_offset,
+    x=alt.X(
+        "Median days:Q",
+        title="Median days",
+        scale=alt.Scale(domain=[0, float(stage_plot["Median days"].max()) * 1.25]),
+        axis=alt.Axis(tickCount=8, format=".0f"),
+    ),
+    color=stage_color,
+    tooltip=[
+        alt.Tooltip("Stage:N"),
+        alt.Tooltip("Outcome:N"),
+        alt.Tooltip("Median days:Q", format=".1f"),
+    ],
+)
+stage_labels = alt.Chart(stage_plot).mark_text(
+    align="left", dx=5, color="#243447", fontSize=12
+).encode(
+    y=stage_axis,
+    yOffset=stage_offset,
+    x=alt.X("Median days:Q"),
+    text=alt.Text("Median days:Q", format=".1f"),
+)
+stage_chart = (stage_bars + stage_labels).properties(height=230).configure_axis(
+    gridColor="#E8EDF3", labelColor="#516071", titleColor="#516071"
+).configure_view(stroke=None)
+
+st.subheader("Where does delivery time accumulate?")
+st.altair_chart(stage_chart, width="stretch")
 
 st.caption(
     f"Data: purchases {purchase_start:%Y-%m-%d} to {purchase_end:%Y-%m-%d} "
-    "(Kaggle frozen snapshot). Proposed production refresh: weekly; "
-    "manager review: monthly after the delivery window closes."
-)
-st.caption(
-    f"Data limits: no extraction timestamp; last observed event was "
-    f"{last_observed_event:%Y-%m-%d}. Months with fewer than 500 due orders "
-    "are omitted from the selector. An absent delivery timestamp may reflect "
-    "an unfinished order or an incomplete record."
+    "(Kaggle snapshot). Production plan: refresh weekly; review monthly."
 )
