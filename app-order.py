@@ -1,9 +1,12 @@
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Order Fulfillment Watch", layout="wide")
 
-# 直接读取 CSV
+TEAM_NAME = "Team 10"  # Replace this with your actual team name.
+
+st.set_page_config(page_title="Delivery Promise Review", layout="wide")
+
+# One row is one Olist order. The CSV sits in the app's working directory.
 df = pd.read_csv("olist_orders_dataset.csv")
 
 date_columns = [
@@ -12,204 +15,169 @@ date_columns = [
     "order_delivered_customer_date",
     "order_estimated_delivery_date",
 ]
-
 for column in date_columns:
     df[column] = pd.to_datetime(df[column], errors="coerce")
 
 purchase_start = df["order_purchase_timestamp"].min()
 purchase_end = df["order_purchase_timestamp"].max()
-last_delivery = df["order_delivered_customer_date"].max()
 
-# 无法确定取消或缺货发生的日期，因此不把这些订单放入历史积压量。
-# 标记为 delivered 却缺少实际送达日期的订单也无法还原其历史状态。
-orders = df.dropna(
-    subset=["order_purchase_timestamp", "order_estimated_delivery_date"]
-).copy()
+# The CSV has no extraction timestamp. This is only a proxy for the last
+# observable day; it is not a claim that the data was complete on that day.
+last_observed_event = max(
+    df["order_purchase_timestamp"].max(),
+    df["order_delivered_carrier_date"].max(),
+    df["order_delivered_customer_date"].max(),
+)
+observation_cutoff = last_observed_event.normalize() + pd.Timedelta(days=1)
 
-orders = orders[
-    ~orders["order_status"].isin(["canceled", "unavailable"])
+# Canceled/unavailable orders have no event date for that outcome. Exclude them
+# from the delivery-promise denominator rather than label them as late.
+excluded_status = df["order_status"].isin(["canceled", "unavailable"])
+missing_delivered_date = (
+    (df["order_status"] == "delivered")
+    & df["order_delivered_customer_date"].isna()
+)
+
+orders = df[
+    df["order_purchase_timestamp"].notna()
+    & df["order_estimated_delivery_date"].notna()
+    & (df["order_estimated_delivery_date"] < observation_cutoff)
+    & ~excluded_status
+    & ~missing_delivered_date
 ].copy()
 
-orders = orders[
-    ~(
-        (orders["order_status"] == "delivered")
-        & orders["order_delivered_customer_date"].isna()
+# Compare calendar dates because the promised delivery field has date-level
+# meaning (00:00:00), while actual delivery includes time of day.
+orders["delivered_late"] = (
+    orders["order_delivered_customer_date"].notna()
+    & (
+        orders["order_delivered_customer_date"].dt.normalize()
+        > orders["order_estimated_delivery_date"].dt.normalize()
     )
-].copy()
+)
+orders["no_delivery_record"] = orders["order_delivered_customer_date"].isna()
+orders["promise_missed"] = (
+    orders["delivered_late"] | orders["no_delivery_record"]
+)
+orders["purchase_month"] = orders["order_purchase_timestamp"].dt.to_period("M").astype(str)
 
+monthly = orders.groupby("purchase_month", sort=True).agg(
+    order_count=("order_id", "size"),
+    missed=("promise_missed", "sum"),
+    delivered_late=("delivered_late", "sum"),
+    no_delivery_record=("no_delivery_record", "sum"),
+)
+monthly["miss_rate_pct"] = 100 * monthly["missed"] / monthly["order_count"]
 
-def open_orders_on(day):
-    """返回截至指定日期早晨，已购买但尚未记录送达的订单。"""
-    purchased = orders[orders["order_purchase_timestamp"] < day]
+# Sparse opening and closing months would make a monthly comparison misleading.
+month_options = monthly.index[monthly["order_count"] >= 500].tolist()
+if not month_options:
+    st.error("No purchase month has enough due orders for this review.")
+    st.stop()
 
-    return purchased[
-        purchased["order_delivered_customer_date"].isna()
-        | (purchased["order_delivered_customer_date"] >= day)
-    ].copy()
-
-
-def overdue_orders_on(day):
-    """返回截至指定日期早晨，已超过预计送达日的未送达订单。"""
-    open_orders = open_orders_on(day)
-
-    return open_orders[
-        open_orders["order_estimated_delivery_date"] < day
-    ].copy()
-
-
-st.title("Order Fulfillment Watch")
+st.title(f"{TEAM_NAME} | Delivery Promise Review")
 st.caption(
-    "For a fulfillment manager: review overdue orders each morning "
-    "and decide which orders need follow-up."
+    "For the fulfillment manager: identify a rise in missed delivery promises "
+    "and decide whether to investigate handoff or delivery time."
 )
 
-min_date = (purchase_start.normalize() + pd.Timedelta(days=1)).date()
-max_event = max(purchase_end, last_delivery)
-max_date = (max_event.normalize() + pd.Timedelta(days=1)).date()
-
-# 2018 年 9—10 月的新订单记录很少，默认展示较完整的 8 月之后的状态。
-default_date = pd.Timestamp("2018-09-01").date()
-default_date = min(max(default_date, min_date), max_date)
-
-selected_date = st.date_input(
-    "Review date (start of day)",
-    value=default_date,
-    min_value=min_date,
-    max_value=max_date,
+selected_month = st.selectbox(
+    "Purchase month to review",
+    month_options,
+    index=len(month_options) - 1,
 )
+selected_index = month_options.index(selected_month)
+selected_orders = orders[orders["purchase_month"] == selected_month]
+current = monthly.loc[selected_month]
+current_rate = float(current["miss_rate_pct"])
 
-day = pd.Timestamp(selected_date)
-open_orders = open_orders_on(day)
-overdue_orders = overdue_orders_on(day)
+previous_rate = None
+if selected_index > 0:
+    previous_month = month_options[selected_index - 1]
+    previous_rate = float(monthly.loc[previous_month, "miss_rate_pct"])
 
-# 在所选日期之前有承运商交接记录的逾期订单
-handoff_recorded = (
-    overdue_orders["order_delivered_carrier_date"].notna()
-    & (overdue_orders["order_delivered_carrier_date"] < day)
-)
-no_handoff_count = int((~handoff_recorded).sum())
+delta = None
+if previous_rate is not None:
+    delta = f"{current_rate - previous_rate:+.1f} pp vs {previous_month}"
 
 col1, col2, col3 = st.columns(3)
-
 with col1:
-    st.metric("Inferred open orders", f"{len(open_orders):,}")
-
+    st.metric(
+        "Missed promise rate",
+        f"{current_rate:.1f}%",
+        delta=delta,
+        delta_color="inverse",
+    )
 with col2:
-    st.metric("Overdue orders", f"{len(overdue_orders):,}")
-
+    st.metric("Delivered late", f"{int(current['delivered_late']):,}")
 with col3:
-    st.metric("Overdue: no handoff recorded", f"{no_handoff_count:,}")
+    st.metric("No delivery recorded", f"{int(current['no_delivery_record']):,}")
 
 st.caption(
-    "Counts are reconstructed from historical timestamps as of the "
-    "start of the selected date."
+    f"Among {int(current['order_count']):,} selected orders whose promised date "
+    "had passed by the last observed day: a miss is a late recorded delivery "
+    "or no delivery record. Canceled and unavailable orders are excluded."
 )
 
-# 图 1：最近 14 天逾期订单数量
-trend_rows = []
-
-for trend_day in pd.date_range(end=day, periods=14, freq="D"):
-    if trend_day < pd.Timestamp(min_date):
-        continue
-
-    trend_rows.append(
-        {
-            "Date": trend_day,
-            "Overdue orders": len(overdue_orders_on(trend_day)),
-        }
+if previous_rate is not None and current_rate - previous_rate >= 2:
+    st.warning(
+        "Proposed review trigger: the miss rate rose at least 2 percentage "
+        "points from the previous month. Check the stage comparison below "
+        "before assigning follow-up."
     )
 
-trend = pd.DataFrame(trend_rows)
+# Chart 1: repeated monthly review of the same decision metric.
+recent_months = month_options[max(0, selected_index - 5) : selected_index + 1]
+trend = monthly.loc[recent_months, ["miss_rate_pct"]].rename(
+    columns={"miss_rate_pct": "Miss rate (%)"}
+)
+st.subheader("Missed promise rate across recent purchase months")
+st.line_chart(trend, y_label="Percent of due orders")
 
-st.subheader("Overdue orders over the past 14 days")
-st.line_chart(trend.set_index("Date"))
+# Chart 2: compare elapsed stages within the selected month. These durations
+# can suggest where to investigate, but do not establish the cause of lateness.
+completed = selected_orders[
+    selected_orders["order_delivered_customer_date"].notna()
+    & selected_orders["order_delivered_carrier_date"].notna()
+].copy()
+completed["handoff_days"] = (
+    completed["order_delivered_carrier_date"]
+    - completed["order_purchase_timestamp"]
+).dt.total_seconds() / 86400
+completed["transit_days"] = (
+    completed["order_delivered_customer_date"]
+    - completed["order_delivered_carrier_date"]
+).dt.total_seconds() / 86400
+completed = completed[
+    (completed["handoff_days"] >= 0) & (completed["transit_days"] >= 0)
+]
 
-# 如果逾期订单连续两天增加，给出明确的处理提示
-if len(trend) >= 3:
-    recent = trend["Overdue orders"].iloc[-3:]
-
-    if recent.iloc[0] < recent.iloc[1] < recent.iloc[2]:
-        st.warning(
-            "Overdue orders increased for two consecutive days. "
-            "Review the order list below and prioritize follow-up."
-        )
-
-# 图 2：逾期订单是否有承运商交接记录
-stage_counts = pd.DataFrame(
-    {
-        "Orders": [
-            no_handoff_count,
-            int(handoff_recorded.sum()),
-        ]
+stage_medians = completed.groupby("delivered_late")[[
+    "handoff_days", "transit_days"
+]].median()
+stage_medians = stage_medians.reindex([False, True]).rename(
+    index={False: "On time", True: "Late"},
+    columns={
+        "handoff_days": "Purchase to carrier handoff",
+        "transit_days": "Carrier to customer",
     },
-    index=[
-        "No handoff recorded",
-        "Handoff recorded",
-    ],
 )
 
-st.subheader("Where are the overdue orders?")
-st.bar_chart(stage_counts)
-
-# 可供经理查看的具体订单
-st.subheader("Orders to review")
-
-if overdue_orders.empty:
-    st.info("No overdue orders for the selected date.")
-else:
-    details = overdue_orders.copy()
-
-    details["days_overdue"] = (
-        day - details["order_estimated_delivery_date"].dt.normalize()
-    ).dt.days
-
-    details["carrier_handoff"] = "No record"
-    details.loc[handoff_recorded, "carrier_handoff"] = "Recorded"
-
-    details = details.sort_values(
-        ["days_overdue", "order_estimated_delivery_date"],
-        ascending=[False, True],
-    )
-
-    st.dataframe(
-        details[
-            [
-                "order_id",
-                "order_purchase_timestamp",
-                "order_estimated_delivery_date",
-                "order_delivered_carrier_date",
-                "days_overdue",
-                "carrier_handoff",
-            ]
-        ]
-        .head(30)
-        .rename(
-            columns={
-                "order_id": "Order ID",
-                "order_purchase_timestamp": "Purchased",
-                "order_estimated_delivery_date": "Estimated delivery",
-                "order_delivered_carrier_date": "Carrier handoff date",
-                "days_overdue": "Days overdue",
-                "carrier_handoff": "Handoff record",
-            }
-        )
-    )
-
+st.subheader("Median days by delivery stage")
+st.bar_chart(stage_medians, y_label="Days", stack=False)
 st.caption(
-    f"Historical purchase period: {purchase_start:%Y-%m-%d} to "
-    f"{purchase_end:%Y-%m-%d}. Proposed production refresh: nightly; "
-    "manager review: each morning."
+    "Stage comparison uses delivered orders with valid carrier dates. "
+    "Different durations are clues for investigation, not proof of cause."
 )
 
 st.caption(
-    "Data limitation: this is a historical demonstration, not a live "
-    "order queue. Canceled and unavailable orders are excluded because "
-    "their cancellation dates are absent. A missing carrier handoff "
-    "date may also mean the record is incomplete."
+    f"Data: purchases {purchase_start:%Y-%m-%d} to {purchase_end:%Y-%m-%d} "
+    "(Kaggle frozen snapshot). Proposed production refresh: weekly; "
+    "manager review: monthly after the delivery window closes."
 )
-
-if selected_date >= pd.Timestamp("2018-09-01").date():
-    st.caption(
-        "The dataset contains very few new purchases in September and "
-        "October 2018, so interpret dates in this period cautiously."
-    )
+st.caption(
+    f"Data limits: no extraction timestamp; last observed event was "
+    f"{last_observed_event:%Y-%m-%d}. Months with fewer than 500 due orders "
+    "are omitted from the selector. An absent delivery timestamp may reflect "
+    "an unfinished order or an incomplete record."
+)
